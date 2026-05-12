@@ -10,7 +10,7 @@ using HarmonyLib;
 
 namespace OstranautsBatterySwap
 {
-    [BepInPlugin("com.dezgard.ostranauts.batteryswap", "Ostranauts Battery Swap", "0.1.0")]
+    [BepInPlugin("com.dezgard.ostranauts.batteryswap", "Ostranauts Battery Swap", "0.2.0")]
     public sealed class Plugin : BaseUnityPlugin
     {
         internal static ManualLogSource Log { get; private set; }
@@ -18,6 +18,7 @@ namespace OstranautsBatterySwap
         internal static ConfigEntry<double> SwapThresholdPercent { get; private set; }
         internal static ConfigEntry<double> SwapCooldownSeconds { get; private set; }
         internal static ConfigEntry<bool> IncludeDragSlot { get; private set; }
+        internal static ConfigEntry<bool> UseShipChargers { get; private set; }
 
         private Harmony _harmony;
 
@@ -27,6 +28,7 @@ namespace OstranautsBatterySwap
             SwapThresholdPercent = Config.Bind("Battery Swap", "SwapThresholdPercent", 10.0, "Swap held tool batteries at or below this charge percent.");
             SwapCooldownSeconds = Config.Bind("Battery Swap", "SwapCooldownSeconds", 2.0, "Minimum seconds between swap attempts for the same tool.");
             IncludeDragSlot = Config.Bind("Battery Swap", "IncludeDragSlot", false, "Also check a powered tool in the drag slot.");
+            UseShipChargers = Config.Bind("Battery Swap", "UseShipChargers", true, "Use compatible charged batteries from loaded ship chargers when no carried spare is available.");
 
             try
             {
@@ -34,7 +36,7 @@ namespace OstranautsBatterySwap
                 Directory.CreateDirectory(dir);
                 var path = Path.Combine(dir, "BatteryAutoSwap-" + DateTime.Now.ToString("yyyyMMdd-HHmmss") + ".log");
                 FileLog = new StreamWriter(path, append: false, Encoding.UTF8) { AutoFlush = true };
-                SwapLog.Write("START", "Ostranauts Battery Swap 0.1.0 file=" + path);
+                SwapLog.Write("START", "Ostranauts Battery Swap 0.2.0 file=" + path);
             }
             catch (Exception ex)
             {
@@ -43,7 +45,7 @@ namespace OstranautsBatterySwap
 
             _harmony = new Harmony("com.dezgard.ostranauts.batteryswap");
             _harmony.PatchAll();
-            SwapLog.Write("LOADED", "Auto battery swap enabled. Held tools only; carried spare batteries only.");
+            SwapLog.Write("LOADED", "Auto battery swap enabled. Held tools, carried spare batteries, and compatible ship chargers.");
         }
 
         private void OnDestroy()
@@ -91,6 +93,15 @@ namespace OstranautsBatterySwap
 
         private static readonly Dictionary<string, DateTime> LastAttemptUtcByTool = new Dictionary<string, DateTime>(StringComparer.OrdinalIgnoreCase);
 
+        private sealed class BatterySource
+        {
+            internal CondOwner Battery;
+            internal CondOwner SourceParent;
+            internal string Kind;
+
+            internal bool IsCharger => string.Equals(Kind, "charger", StringComparison.OrdinalIgnoreCase);
+        }
+
         internal static void TrySwapHeldTools(CondOwner actor, string reason)
         {
             if (actor == null)
@@ -123,8 +134,8 @@ namespace OstranautsBatterySwap
 
                 LastAttemptUtcByTool[key] = now;
 
-                var spare = FindBestCompatibleSpare(actor, tool, currentBattery);
-                if (spare == null)
+                var source = FindBestCompatibleSource(actor, tool, currentBattery);
+                if (source == null)
                 {
                     SwapLog.Write("NO_SPARE", "actor=" + Name(actor)
                         + " tool={" + Item(tool) + "}"
@@ -136,15 +147,18 @@ namespace OstranautsBatterySwap
                 SwapLog.Write("SWAP_BEGIN", "actor=" + Name(actor)
                     + " tool={" + Item(tool) + "}"
                     + " old={" + Item(currentBattery) + "}"
-                    + " spare={" + Item(spare) + "}"
+                    + " spare={" + Item(source.Battery) + "}"
+                    + " source=" + source.Kind
+                    + " sourceParent={" + Item(source.SourceParent) + "}"
                     + " reason=" + reason);
 
-                if (!SwapBattery(actor, tool, currentBattery, spare))
+                if (!SwapBattery(actor, tool, currentBattery, source))
                 {
                     SwapLog.Write("SWAP_FAIL", "actor=" + Name(actor)
                         + " tool={" + Item(tool) + "}"
                         + " old={" + Item(currentBattery) + "}"
-                        + " spare={" + Item(spare) + "}");
+                        + " spare={" + Item(source.Battery) + "}"
+                        + " source=" + source.Kind);
                     return;
                 }
 
@@ -160,10 +174,9 @@ namespace OstranautsBatterySwap
             }
         }
 
-        private static bool SwapBattery(CondOwner actor, CondOwner tool, CondOwner oldBattery, CondOwner spare)
+        private static bool SwapBattery(CondOwner actor, CondOwner tool, CondOwner oldBattery, BatterySource source)
         {
-            var sourceParent = spare.objCOParent;
-            var removedSpare = RemoveFromParent(spare);
+            var removedSpare = RemoveFromParent(source.Battery);
             if (removedSpare == null)
                 return false;
 
@@ -173,21 +186,21 @@ namespace OstranautsBatterySwap
                 removedOld = tool.objContainer?.RemoveCO(oldBattery, bForce: false) ?? tool.RemoveCO(oldBattery, bForce: false);
                 if (removedOld == null)
                 {
-                    PutBack(sourceParent, actor, removedSpare);
+                    PutBackToSource(source, actor, removedSpare);
                     return false;
                 }
             }
 
             if (!AddToTool(tool, removedSpare))
             {
-                PutBack(sourceParent, actor, removedSpare);
+                PutBackToSource(source, actor, removedSpare);
                 if (removedOld != null)
                     AddToTool(tool, removedOld);
                 return false;
             }
 
             if (removedOld != null)
-                PutBack(sourceParent, actor, removedOld);
+                PutOldBattery(actor, source, removedOld);
 
             return true;
         }
@@ -230,6 +243,49 @@ namespace OstranautsBatterySwap
             }
         }
 
+        private static bool AddToContainer(CondOwner containerOwner, CondOwner item)
+        {
+            if (containerOwner?.objContainer == null || item == null)
+                return false;
+
+            try
+            {
+                var pair = new PairXY { x = 0, y = 0 };
+                containerOwner.objContainer.AddCOSimple(item, pair);
+                return IsDescendantOf(item, containerOwner);
+            }
+            catch (Exception ex)
+            {
+                SwapLog.Write("ADD_CONTAINER_ERROR", "container={" + Item(containerOwner) + "} item={" + Item(item) + "} error=" + ex.GetType().Name + " " + ex.Message);
+                return false;
+            }
+        }
+
+        private static void PutBackToSource(BatterySource source, CondOwner actor, CondOwner item)
+        {
+            if (source != null && source.IsCharger && AddToContainer(source.SourceParent, item))
+                return;
+
+            PutBack(source?.SourceParent, actor, item);
+        }
+
+        private static void PutOldBattery(CondOwner actor, BatterySource source, CondOwner oldBattery)
+        {
+            if (source != null && source.IsCharger)
+            {
+                if (CanAcceptBattery(source.SourceParent, oldBattery) && AddToContainer(source.SourceParent, oldBattery))
+                {
+                    SwapLog.Write("PUT_OLD_IN_CHARGER", "charger={" + Item(source.SourceParent) + "} old={" + Item(oldBattery) + "}");
+                    return;
+                }
+
+                PutBack(actor, actor, oldBattery);
+                return;
+            }
+
+            PutBack(source?.SourceParent, actor, oldBattery);
+        }
+
         private static void PutBack(CondOwner preferredParent, CondOwner actor, CondOwner item)
         {
             if (item == null)
@@ -251,8 +307,14 @@ namespace OstranautsBatterySwap
 
             try
             {
+                if (IsDescendantOf(item, parent))
+                    return true;
+
+                if (IsBatteryCharger(parent) && CanAcceptBattery(parent, item))
+                    return AddToContainer(parent, item);
+
                 var result = parent.AddCO(item, bEquip: false, bOverflow: true, bIgnoreLocks: true);
-                return result != null && item.objCOParent != null;
+                return IsDescendantOf(item, parent) || (result != null && item.objCOParent != null);
             }
             catch (Exception ex)
             {
@@ -314,11 +376,23 @@ namespace OstranautsBatterySwap
             }
         }
 
-        private static CondOwner FindBestCompatibleSpare(CondOwner actor, CondOwner tool, CondOwner currentBattery)
+        private static BatterySource FindBestCompatibleSource(CondOwner actor, CondOwner tool, CondOwner currentBattery)
+        {
+            var carried = FindBestCarriedSpare(actor, tool, currentBattery);
+            if (carried != null)
+                return carried;
+
+            if (!Plugin.UseShipChargers.Value)
+                return null;
+
+            return FindBestChargerSpare(actor, tool, currentBattery);
+        }
+
+        private static BatterySource FindBestCarriedSpare(CondOwner actor, CondOwner tool, CondOwner currentBattery)
         {
             var currentId = currentBattery?.strID;
 
-            return GetCarried(actor)
+            var spare = GetCarried(actor)
                 .Where(IsBattery)
                 .Where(b => !string.Equals(b.strID, currentId, StringComparison.OrdinalIgnoreCase))
                 .Where(b => IsUsableSpare(actor, b))
@@ -326,6 +400,98 @@ namespace OstranautsBatterySwap
                 .Where(b => PowerRatio(b) > Math.Max(Plugin.SwapThresholdPercent.Value / 100.0, 0.01))
                 .OrderByDescending(PowerRatio)
                 .FirstOrDefault();
+
+            return spare == null
+                ? null
+                : new BatterySource
+                {
+                    Battery = spare,
+                    SourceParent = spare.objCOParent,
+                    Kind = "carried"
+                };
+        }
+
+        private static BatterySource FindBestChargerSpare(CondOwner actor, CondOwner tool, CondOwner currentBattery)
+        {
+            var currentId = currentBattery?.strID;
+            var minimumRatio = Math.Max(Plugin.SwapThresholdPercent.Value / 100.0, 0.01);
+            var bestRatio = minimumRatio;
+            BatterySource best = null;
+            var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+            foreach (var charger in GetActorShipCOs(actor).Where(IsBatteryCharger))
+            {
+                var key = charger.strID ?? charger.GetHashCode().ToString();
+                if (!seen.Add(key))
+                    continue;
+
+                var battery = ChargerBattery(charger);
+                if (battery == null)
+                    continue;
+
+                if (string.Equals(battery.strID, currentId, StringComparison.OrdinalIgnoreCase))
+                    continue;
+
+                if (!Compatible(tool, battery))
+                    continue;
+
+                if (currentBattery != null && !CanAcceptBattery(charger, currentBattery))
+                    continue;
+
+                var ratio = PowerRatio(battery);
+                if (ratio <= bestRatio)
+                    continue;
+
+                bestRatio = ratio;
+                best = new BatterySource
+                {
+                    Battery = battery,
+                    SourceParent = charger,
+                    Kind = "charger"
+                };
+            }
+
+            if (best != null)
+            {
+                SwapLog.Write("CHARGER_SPARE", "actor=" + Name(actor)
+                    + " charger={" + Item(best.SourceParent) + "}"
+                    + " battery={" + Item(best.Battery) + "}");
+            }
+
+            return best;
+        }
+
+        private static IEnumerable<CondOwner> GetActorShipCOs(CondOwner actor)
+        {
+            var ship = actor?.ship;
+            if (ship == null)
+                return new List<CondOwner>();
+
+            try
+            {
+                return ship.GetCOs(null, bSubObjects: true, bAllowDocked: true, bAllowLocked: true) ?? new List<CondOwner>();
+            }
+            catch (Exception ex)
+            {
+                SwapLog.Write("SHIP_SCAN_ERROR", "actor=" + Name(actor) + " error=" + ex.GetType().Name + " " + ex.Message);
+                return new List<CondOwner>();
+            }
+        }
+
+        private static CondOwner ChargerBattery(CondOwner charger)
+        {
+            if (charger?.objContainer == null)
+                return null;
+
+            try
+            {
+                return charger.objContainer.GetCOs(bAllowLocked: true, objCondTrig: null)
+                    .FirstOrDefault(IsBattery);
+            }
+            catch
+            {
+                return null;
+            }
         }
 
         private static IEnumerable<CondOwner> GetCarried(CondOwner actor)
@@ -387,6 +553,25 @@ namespace OstranautsBatterySwap
             if (allowed.IndexOf("Battery", StringComparison.OrdinalIgnoreCase) >= 0)
                 return IsBattery(battery);
             return false;
+        }
+
+        private static bool CanAcceptBattery(CondOwner containerOwner, CondOwner battery)
+        {
+            if (containerOwner?.objContainer == null || battery == null)
+                return false;
+
+            try
+            {
+                return containerOwner.objContainer.AllowedCO(battery);
+            }
+            catch
+            {
+                var allowed = containerOwner.objContainer.ctAllowed?.strName ?? "";
+                if (allowed.IndexOf("Battery", StringComparison.OrdinalIgnoreCase) < 0)
+                    return false;
+
+                return IsBattery(battery);
+            }
         }
 
         private static bool BatteryIsLow(CondOwner battery)
