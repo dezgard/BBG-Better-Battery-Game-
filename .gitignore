@@ -1,0 +1,12 @@
+bin/
+obj/
+.vs/
+*.user
+*.suo
+*.tmp
+*.log
+
+# Keep packaged release files committed.
+!release/**/*.dll
+!release/**/*.md
+!release/**/*.zip
