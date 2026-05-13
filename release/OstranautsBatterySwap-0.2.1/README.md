@@ -4,7 +4,7 @@ By Dezgard
 
 Better Battery Game automatically swaps low batteries in held powered tools when the character has a compatible charged spare.
 
-Version 0.2.2 adds safer charger handling. The mod uses carried spare batteries first, then walks to compatible ship chargers only when replacing an existing low battery.
+Version 0.2.1 adds walk-to-charger support. The mod uses carried spare batteries first, then walks to compatible ship chargers if no carried spare is available.
 
 The mod checks the battery inside the held tool, not the tool itself. If the battery is low, it removes the dead battery and inserts the best compatible charged battery it can safely use.
 
@@ -17,7 +17,6 @@ The mod also creates support logs. If something goes wrong, close the game and u
 - Uses carried spare batteries.
 - Uses ship chargers as fallback.
 - Walks to chargers before charger swaps.
-- Does not drain chargers to fill empty tools.
 - Requeues the original tool action after a charger swap.
 - Puts drained batteries into chargers.
 - Matches compatible battery types.
@@ -50,7 +49,7 @@ Ostranauts\BepInEx\plugins\
 When loaded, the BepInEx log should show:
 
 ```text
-Ostranauts Battery Swap 0.2.2 loaded.
+Ostranauts Battery Swap 0.2.1 loaded.
 ```
 
 ## Config
@@ -95,7 +94,6 @@ Useful log lines:
 - `CHARGER_ARRIVED`
 - `CHARGER_REQUEUE_DONE`
 - `PUT_OLD_IN_CHARGER`
-- `EMPTY_TOOL_NO_CARRIED_SPARE`
 - `NO_SPARE`
 - `SWAP_FAIL`
 - `SWAP_ERROR`
@@ -119,7 +117,7 @@ bin\Release\net472\OstranautsBatterySwap.dll
 The current packaged build is kept in:
 
 ```text
-release\OstranautsBatterySwap-0.2.2\
+release\OstranautsBatterySwap-0.2.1\
 ```
 
 ## Notes

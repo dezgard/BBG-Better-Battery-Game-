@@ -3,7 +3,7 @@
     <TargetFramework>net472</TargetFramework>
     <AssemblyName>OstranautsBatterySwap</AssemblyName>
     <RootNamespace>OstranautsBatterySwap</RootNamespace>
-    <Version>0.2.0</Version>
+    <Version>0.2.2</Version>
     <LangVersion>latest</LangVersion>
     <GameDir>G:\Steam\steamapps\common\Ostranauts</GameDir>
   </PropertyGroup>

@@ -1,12 +1,5 @@
 # Changelog
 
-## 0.2.2
-
-- Stopped ship chargers filling empty tools.
-- Empty tools can still use carried spare batteries.
-- Added a guard against duplicate charger-walk swaps.
-- Added empty-tool charger skip logging.
-
 ## 0.2.1
 
 - Changed charger swaps to walk to the charger first.

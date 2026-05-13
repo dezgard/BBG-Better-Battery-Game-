@@ -7,10 +7,11 @@ using BepInEx;
 using BepInEx.Configuration;
 using BepInEx.Logging;
 using HarmonyLib;
+using UnityEngine;
 
 namespace OstranautsBatterySwap
 {
-    [BepInPlugin("com.dezgard.ostranauts.batteryswap", "Ostranauts Battery Swap", "0.2.0")]
+    [BepInPlugin("com.dezgard.ostranauts.batteryswap", "Ostranauts Battery Swap", "0.2.2")]
     public sealed class Plugin : BaseUnityPlugin
     {
         internal static ManualLogSource Log { get; private set; }
@@ -19,6 +20,8 @@ namespace OstranautsBatterySwap
         internal static ConfigEntry<double> SwapCooldownSeconds { get; private set; }
         internal static ConfigEntry<bool> IncludeDragSlot { get; private set; }
         internal static ConfigEntry<bool> UseShipChargers { get; private set; }
+        internal static ConfigEntry<bool> WalkToShipChargers { get; private set; }
+        internal static ConfigEntry<double> ChargerUseRangeTiles { get; private set; }
 
         private Harmony _harmony;
 
@@ -29,6 +32,8 @@ namespace OstranautsBatterySwap
             SwapCooldownSeconds = Config.Bind("Battery Swap", "SwapCooldownSeconds", 2.0, "Minimum seconds between swap attempts for the same tool.");
             IncludeDragSlot = Config.Bind("Battery Swap", "IncludeDragSlot", false, "Also check a powered tool in the drag slot.");
             UseShipChargers = Config.Bind("Battery Swap", "UseShipChargers", true, "Use compatible charged batteries from loaded ship chargers when no carried spare is available.");
+            WalkToShipChargers = Config.Bind("Battery Swap", "WalkToShipChargers", true, "Walk to ship chargers before swapping charger batteries instead of swapping remotely.");
+            ChargerUseRangeTiles = Config.Bind("Battery Swap", "ChargerUseRangeTiles", 1.25, "How close the character must be to a charger before BBG swaps a charger battery.");
 
             try
             {
@@ -36,7 +41,7 @@ namespace OstranautsBatterySwap
                 Directory.CreateDirectory(dir);
                 var path = Path.Combine(dir, "BatteryAutoSwap-" + DateTime.Now.ToString("yyyyMMdd-HHmmss") + ".log");
                 FileLog = new StreamWriter(path, append: false, Encoding.UTF8) { AutoFlush = true };
-                SwapLog.Write("START", "Ostranauts Battery Swap 0.2.0 file=" + path);
+                SwapLog.Write("START", "Ostranauts Battery Swap 0.2.2 file=" + path);
             }
             catch (Exception ex)
             {
@@ -45,7 +50,7 @@ namespace OstranautsBatterySwap
 
             _harmony = new Harmony("com.dezgard.ostranauts.batteryswap");
             _harmony.PatchAll();
-            SwapLog.Write("LOADED", "Auto battery swap enabled. Held tools, carried spare batteries, and compatible ship chargers.");
+            SwapLog.Write("LOADED", "Auto battery swap enabled. Held tools, carried spare batteries, and walk-to-charger fallback.");
         }
 
         private void OnDestroy()
@@ -92,6 +97,10 @@ namespace OstranautsBatterySwap
         };
 
         private static readonly Dictionary<string, DateTime> LastAttemptUtcByTool = new Dictionary<string, DateTime>(StringComparer.OrdinalIgnoreCase);
+        private static readonly Dictionary<string, PendingChargerSwap> PendingChargerSwaps = new Dictionary<string, PendingChargerSwap>(StringComparer.OrdinalIgnoreCase);
+        private static int InternalQueueDepth;
+
+        internal static bool IsInternalQueueing => InternalQueueDepth > 0;
 
         private sealed class BatterySource
         {
@@ -102,46 +111,169 @@ namespace OstranautsBatterySwap
             internal bool IsCharger => string.Equals(Kind, "charger", StringComparison.OrdinalIgnoreCase);
         }
 
-        internal static void TrySwapHeldTools(CondOwner actor, string reason)
+        private sealed class PendingChargerSwap
         {
+            internal string ActorId;
+            internal string ToolId;
+            internal string ChargerId;
+            internal string OriginalTargetId;
+            internal string OriginalInteractionName;
+            internal bool OriginalWasManual;
+            internal DateTime CreatedUtc;
+        }
+
+        internal static bool TrySwapHeldTools(CondOwner actor, string reason, CondOwner originalTarget, Interaction originalInteraction)
+        {
+            if (IsInternalQueueing)
+                return true;
+
             if (actor == null)
-                return;
+                return true;
 
             foreach (var tool in HeldTools(actor))
             {
-                TrySwapTool(actor, tool, reason);
+                if (!TrySwapTool(actor, tool, reason, originalTarget, originalInteraction))
+                    return false;
             }
+
+            return true;
         }
 
-        private static void TrySwapTool(CondOwner actor, CondOwner tool, string reason)
+        internal static void TryCompletePending(CondOwner actor, string reason)
+        {
+            if (IsInternalQueueing || actor == null)
+                return;
+
+            var key = actor.strID ?? actor.strName;
+            if (string.IsNullOrEmpty(key) || !PendingChargerSwaps.TryGetValue(key, out var pending))
+                return;
+
+            if ((DateTime.UtcNow - pending.CreatedUtc).TotalSeconds > 180.0)
+            {
+                PendingChargerSwaps.Remove(key);
+                SwapLog.Write("CHARGER_PENDING_EXPIRED", "actor=" + Name(actor) + " reason=" + reason);
+                return;
+            }
+
+            var tool = ResolveCO(pending.ToolId);
+            var charger = ResolveCO(pending.ChargerId);
+            if (tool == null || charger == null)
+            {
+                PendingChargerSwaps.Remove(key);
+                SwapLog.Write("CHARGER_PENDING_MISSING", "actor=" + Name(actor)
+                    + " toolId=" + pending.ToolId
+                    + " chargerId=" + pending.ChargerId
+                    + " reason=" + reason);
+                return;
+            }
+
+            if (!IsNear(actor, charger))
+                return;
+
+            var currentBattery = ToolBattery(tool);
+            if (currentBattery == null)
+            {
+                PendingChargerSwaps.Remove(key);
+                SwapLog.Write("CHARGER_PENDING_EMPTY_TOOL", "actor=" + Name(actor)
+                    + " tool={" + Item(tool) + "}"
+                    + " charger={" + Item(charger) + "}"
+                    + " reason=" + reason);
+                RequeueOriginal(actor, pending);
+                return;
+            }
+
+            if (!BatteryIsLow(currentBattery))
+            {
+                PendingChargerSwaps.Remove(key);
+                SwapLog.Write("CHARGER_PENDING_NOT_NEEDED", "actor=" + Name(actor)
+                    + " tool={" + Item(tool) + "}"
+                    + " current={" + Item(currentBattery) + "}"
+                    + " reason=" + reason);
+                RequeueOriginal(actor, pending);
+                return;
+            }
+
+            var source = ChargerSourceFrom(charger, tool, currentBattery);
+            if (source == null)
+            {
+                PendingChargerSwaps.Remove(key);
+                SwapLog.Write("CHARGER_PENDING_NO_SOURCE", "actor=" + Name(actor)
+                    + " tool={" + Item(tool) + "}"
+                    + " charger={" + Item(charger) + "}"
+                    + " reason=" + reason);
+                return;
+            }
+
+            SwapLog.Write("CHARGER_ARRIVED", "actor=" + Name(actor)
+                + " tool={" + Item(tool) + "}"
+                + " charger={" + Item(charger) + "}"
+                + " spare={" + Item(source.Battery) + "}"
+                + " reason=" + reason);
+
+            if (!SwapBattery(actor, tool, currentBattery, source))
+            {
+                PendingChargerSwaps.Remove(key);
+                SwapLog.Write("CHARGER_SWAP_FAIL", "actor=" + Name(actor)
+                    + " tool={" + Item(tool) + "}"
+                    + " charger={" + Item(charger) + "}"
+                    + " spare={" + Item(source.Battery) + "}");
+                return;
+            }
+
+            PendingChargerSwaps.Remove(key);
+            SwapLog.Write("SWAP_DONE", "actor=" + Name(actor)
+                + " tool={" + Item(tool) + "}"
+                + " now={" + Item(ToolBattery(tool)) + "}"
+                + " source=charger_walk");
+            RequeueOriginal(actor, pending);
+        }
+
+        private static bool TrySwapTool(CondOwner actor, CondOwner tool, string reason, CondOwner originalTarget, Interaction originalInteraction)
         {
             try
             {
                 if (!IsPoweredTool(tool))
-                    return;
+                    return true;
+
+                var actorKey = actor.strID ?? actor.strName;
+                if (!string.IsNullOrEmpty(actorKey) && PendingChargerSwaps.ContainsKey(actorKey))
+                    return true;
 
                 var key = tool.strID ?? tool.strName ?? tool.strItemDef ?? "?";
                 var now = DateTime.UtcNow;
                 if (LastAttemptUtcByTool.TryGetValue(key, out var last)
                     && (now - last).TotalSeconds < Math.Max(0.25, Plugin.SwapCooldownSeconds.Value))
                 {
-                    return;
+                    return true;
                 }
 
                 var currentBattery = ToolBattery(tool);
                 if (!BatteryIsLow(currentBattery))
-                    return;
+                    return true;
 
                 LastAttemptUtcByTool[key] = now;
 
                 var source = FindBestCompatibleSource(actor, tool, currentBattery);
                 if (source == null)
                 {
+                    if (currentBattery == null)
+                    {
+                        SwapLog.Write("EMPTY_TOOL_NO_CARRIED_SPARE", "actor=" + Name(actor)
+                            + " tool={" + Item(tool) + "}"
+                            + " reason=" + reason);
+                        return true;
+                    }
+
                     SwapLog.Write("NO_SPARE", "actor=" + Name(actor)
                         + " tool={" + Item(tool) + "}"
                         + " current={" + Item(currentBattery) + "}"
                         + " reason=" + reason);
-                    return;
+                    return true;
+                }
+
+                if (source.IsCharger && Plugin.WalkToShipChargers.Value && !IsNear(actor, source.SourceParent))
+                {
+                    return !QueueWalkToCharger(actor, tool, currentBattery, source, originalTarget, originalInteraction, reason);
                 }
 
                 SwapLog.Write("SWAP_BEGIN", "actor=" + Name(actor)
@@ -159,18 +291,20 @@ namespace OstranautsBatterySwap
                         + " old={" + Item(currentBattery) + "}"
                         + " spare={" + Item(source.Battery) + "}"
                         + " source=" + source.Kind);
-                    return;
+                    return true;
                 }
 
                 SwapLog.Write("SWAP_DONE", "actor=" + Name(actor)
                     + " tool={" + Item(tool) + "}"
                     + " now={" + Item(ToolBattery(tool)) + "}");
+                return true;
             }
             catch (Exception ex)
             {
                 SwapLog.Write("SWAP_ERROR", "actor=" + Name(actor)
                     + " tool={" + Item(tool) + "}"
                     + " error=" + ex.GetType().Name + " " + ex.Message);
+                return true;
             }
         }
 
@@ -382,6 +516,9 @@ namespace OstranautsBatterySwap
             if (carried != null)
                 return carried;
 
+            if (currentBattery == null)
+                return null;
+
             if (!Plugin.UseShipChargers.Value)
                 return null;
 
@@ -426,17 +563,13 @@ namespace OstranautsBatterySwap
                     continue;
 
                 var battery = ChargerBattery(charger);
-                if (battery == null)
+                if (battery == null
+                    || string.Equals(battery.strID, currentId, StringComparison.OrdinalIgnoreCase)
+                    || !Compatible(tool, battery)
+                    || (currentBattery != null && !CanAcceptBattery(charger, currentBattery)))
+                {
                     continue;
-
-                if (string.Equals(battery.strID, currentId, StringComparison.OrdinalIgnoreCase))
-                    continue;
-
-                if (!Compatible(tool, battery))
-                    continue;
-
-                if (currentBattery != null && !CanAcceptBattery(charger, currentBattery))
-                    continue;
+                }
 
                 var ratio = PowerRatio(battery);
                 if (ratio <= bestRatio)
@@ -459,6 +592,29 @@ namespace OstranautsBatterySwap
             }
 
             return best;
+        }
+
+        private static BatterySource ChargerSourceFrom(CondOwner charger, CondOwner tool, CondOwner currentBattery)
+        {
+            var battery = ChargerBattery(charger);
+            if (battery == null)
+                return null;
+
+            if (!Compatible(tool, battery))
+                return null;
+
+            if (currentBattery != null && !CanAcceptBattery(charger, currentBattery))
+                return null;
+
+            if (PowerRatio(battery) <= Math.Max(Plugin.SwapThresholdPercent.Value / 100.0, 0.01))
+                return null;
+
+            return new BatterySource
+            {
+                Battery = battery,
+                SourceParent = charger,
+                Kind = "charger"
+            };
         }
 
         private static IEnumerable<CondOwner> GetActorShipCOs(CondOwner actor)
@@ -487,6 +643,163 @@ namespace OstranautsBatterySwap
             {
                 return charger.objContainer.GetCOs(bAllowLocked: true, objCondTrig: null)
                     .FirstOrDefault(IsBattery);
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
+        private static bool QueueWalkToCharger(CondOwner actor, CondOwner tool, CondOwner currentBattery, BatterySource source, CondOwner originalTarget, Interaction originalInteraction, string reason)
+        {
+            if (actor?.ship == null || source?.SourceParent == null || string.IsNullOrEmpty(actor.strID))
+                return false;
+
+            try
+            {
+                var usePos = source.SourceParent.GetPos("use");
+                var tile = actor.ship.GetTileAtWorldCoords1(usePos.x, usePos.y, bAllowDocked: true);
+                if (tile == null)
+                {
+                    SwapLog.Write("CHARGER_WALK_FAIL", "actor=" + Name(actor)
+                        + " charger={" + Item(source.SourceParent) + "}"
+                        + " reason=no_tile");
+                    return false;
+                }
+
+                PendingChargerSwaps[actor.strID] = new PendingChargerSwap
+                {
+                    ActorId = actor.strID,
+                    ToolId = tool.strID,
+                    ChargerId = source.SourceParent.strID,
+                    OriginalTargetId = originalTarget?.strID,
+                    OriginalInteractionName = originalInteraction?.strName,
+                    OriginalWasManual = originalInteraction?.bManual ?? true,
+                    CreatedUtc = DateTime.UtcNow
+                };
+
+                InternalQueueDepth++;
+                bool queued;
+                try
+                {
+                    queued = actor.AIIssueOrder(null, null, originalInteraction?.bManual ?? true, tile, usePos.x, usePos.y);
+                }
+                finally
+                {
+                    InternalQueueDepth--;
+                }
+
+                if (!queued)
+                {
+                    PendingChargerSwaps.Remove(actor.strID);
+                    SwapLog.Write("CHARGER_WALK_FAIL", "actor=" + Name(actor)
+                        + " charger={" + Item(source.SourceParent) + "}"
+                        + " reason=queue_failed");
+                    return false;
+                }
+
+                SwapLog.Write("CHARGER_WALK_QUEUED", "actor=" + Name(actor)
+                    + " tool={" + Item(tool) + "}"
+                    + " old={" + Item(currentBattery) + "}"
+                    + " charger={" + Item(source.SourceParent) + "}"
+                    + " spare={" + Item(source.Battery) + "}"
+                    + " original=" + (originalInteraction?.strName ?? "<null>")
+                    + " target={" + Item(originalTarget) + "}"
+                    + " reason=" + reason);
+                return true;
+            }
+            catch (Exception ex)
+            {
+                if (!string.IsNullOrEmpty(actor?.strID))
+                    PendingChargerSwaps.Remove(actor.strID);
+
+                SwapLog.Write("CHARGER_WALK_ERROR", "actor=" + Name(actor)
+                    + " charger={" + Item(source?.SourceParent) + "}"
+                    + " error=" + ex.GetType().Name + " " + ex.Message);
+                return false;
+            }
+        }
+
+        private static void RequeueOriginal(CondOwner actor, PendingChargerSwap pending)
+        {
+            if (actor == null || pending == null || string.IsNullOrEmpty(pending.OriginalInteractionName))
+                return;
+
+            var target = ResolveCO(pending.OriginalTargetId);
+            if (target == null)
+            {
+                SwapLog.Write("CHARGER_REQUEUE_SKIP", "actor=" + Name(actor)
+                    + " interaction=" + pending.OriginalInteractionName
+                    + " targetId=" + pending.OriginalTargetId
+                    + " reason=target_missing");
+                return;
+            }
+
+            var interaction = DataHandler.GetInteraction(pending.OriginalInteractionName);
+            if (interaction == null)
+            {
+                SwapLog.Write("CHARGER_REQUEUE_SKIP", "actor=" + Name(actor)
+                    + " interaction=" + pending.OriginalInteractionName
+                    + " reason=interaction_missing");
+                return;
+            }
+
+            interaction.bManual = pending.OriginalWasManual;
+
+            InternalQueueDepth++;
+            try
+            {
+                if (actor.QueueInteraction(target, interaction))
+                {
+                    SwapLog.Write("CHARGER_REQUEUE_DONE", "actor=" + Name(actor)
+                        + " interaction=" + pending.OriginalInteractionName
+                        + " target={" + Item(target) + "}");
+                }
+                else
+                {
+                    SwapLog.Write("CHARGER_REQUEUE_FAIL", "actor=" + Name(actor)
+                        + " interaction=" + pending.OriginalInteractionName
+                        + " target={" + Item(target) + "}");
+                }
+            }
+            catch (Exception ex)
+            {
+                SwapLog.Write("CHARGER_REQUEUE_ERROR", "actor=" + Name(actor)
+                    + " interaction=" + pending.OriginalInteractionName
+                    + " error=" + ex.GetType().Name + " " + ex.Message);
+            }
+            finally
+            {
+                InternalQueueDepth--;
+            }
+        }
+
+        private static bool IsNear(CondOwner actor, CondOwner target)
+        {
+            if (actor == null || target == null)
+                return false;
+
+            try
+            {
+                var usePos = target.GetPos("use");
+                var actorPos = actor.transform.position;
+                var distance = Vector2.Distance(new Vector2(actorPos.x, actorPos.y), usePos);
+                return distance <= Math.Max(0.25, Plugin.ChargerUseRangeTiles.Value);
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private static CondOwner ResolveCO(string id)
+        {
+            if (string.IsNullOrEmpty(id))
+                return null;
+
+            try
+            {
+                return DataHandler.mapCOs.TryGetValue(id, out var co) ? co : null;
             }
             catch
             {
@@ -693,9 +1006,18 @@ namespace OstranautsBatterySwap
     [HarmonyPatch(typeof(CondOwner), "QueueInteraction")]
     internal static class QueueInteractionPatch
     {
-        private static void Prefix(CondOwner __instance, Interaction objInteraction)
+        private static bool Prefix(CondOwner __instance, CondOwner objTarget, Interaction objInteraction)
         {
-            BatterySwap.TrySwapHeldTools(__instance, objInteraction?.strName ?? "QueueInteraction");
+            return BatterySwap.TrySwapHeldTools(__instance, objInteraction?.strName ?? "QueueInteraction", objTarget, objInteraction);
+        }
+    }
+
+    [HarmonyPatch(typeof(CondOwner), "ClearInteraction")]
+    internal static class ClearInteractionPatch
+    {
+        private static void Postfix(CondOwner __instance, Interaction objInteraction)
+        {
+            BatterySwap.TryCompletePending(__instance, "Clear:" + (objInteraction?.strName ?? "<null>"));
         }
     }
 }
